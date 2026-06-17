@@ -118,6 +118,15 @@ Official deployment documentation: https://docs.aws.amazon.com/eks/latest/usergu
     - For target type `ip`, AWS requires health checks to be **always enabled** (they cannot be disabled), and the health-check protocol cannot be `UDP`/`TCP_UDP`. Do not set `healthCheckEnabled:false` or a UDP health-check protocol, otherwise the target group is rejected by AWS. See [CreateTargetGroup](https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/API_CreateTargetGroup.html).
     - Because health checks are TCP-based, the pod must accept TCP connections on the port for the target to become healthy. Ensure the pod/ENI SecurityGroup allows the health-check and client traffic on that port.
 
+#### AllocatePolicy
+- Meaning: How ports are allocated across multiple NLBs listed in NlbARNs. Only relevant when more than one NLB is configured.
+- Format: `default` or `balanced`
+    - **default** (first-fit / spillover): allocate from the NLBs in the order they appear in NlbARNs; fill the earlier NLB before spilling over to the next one. This is the original behavior.
+    - **balanced**: allocate to the NLB that currently has the most free ports, spreading game servers evenly across the configured NLBs. Useful for fault-domain isolation (a single NLB failing or reaching its listener limit affects fewer game servers).
+- Default: `default` (keeps backward compatibility; existing GameServerSets are unaffected).
+- Support for change: Yes
+- Note: A port number is tracked per-NLB, so the same port (e.g. 9001) can be used on different NLBs simultaneously — they are distinct endpoints (different NLB DNS names).
+
 #### Fixed
 - Meaning: Whether the access port is fixed. If yes, even if the pod is deleted and rebuilt, the mapping between the internal and external networks will not change.
 - Format: false / true
@@ -189,3 +198,29 @@ networkStatus:
     lastTransitionTime: "2024-05-30T03:34:14Z"
     networkType: AmazonWebServices-NLB
 ```
+### Usage Example: multiple NLBs with balanced allocation
+
+When the number of game servers exceeds the listener limit of a single NLB
+(`L-B6DF7632`, default 50), configure multiple NLBs in `NlbARNs` and set
+`AllocatePolicy: balanced` to spread game servers evenly across them:
+
+```yaml
+  network:
+    networkType: AmazonWebServices-NLB
+    networkConf:
+    - name: NlbARNs
+      value: "arn:aws:elasticloadbalancing:us-east-1:xxxx:loadbalancer/net/nlb-a/aaaa,arn:aws:elasticloadbalancing:us-east-1:xxxx:loadbalancer/net/nlb-b/bbbb"
+    - name: AllocatePolicy
+      value: "balanced"
+    - name: NlbVPCId
+      value: "vpc-0bbc9f9f0ffexxxxx"
+    - name: PortProtocols
+      value: "8601/TCPUDP"
+```
+
+With `balanced`, 30 game servers across 2 NLBs are distributed roughly 15/15
+(each new server lands on whichever NLB currently has the most free ports),
+instead of `default`, which fills the first NLB to its limit before using the
+second. All NLBs must be created in AWS in advance and listed in `NlbARNs`;
+adding an NLB to a running GameServerSet's `NlbARNs` triggers a network
+reconfiguration for that GameServerSet, so plan capacity ahead.

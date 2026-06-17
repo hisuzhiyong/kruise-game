@@ -117,6 +117,15 @@ TargetGroupBinding的CRD及控制器：https://github.com/kubernetes-sigs/aws-lo
     - 对于目标类型 `ip`，AWS 要求健康检查**必须开启**（无法关闭），且健康检查协议不能为 `UDP`/`TCP_UDP`。不要设置 `healthCheckEnabled:false` 或 UDP 健康检查协议，否则目标组会被 AWS 拒绝。参见 [CreateTargetGroup](https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/API_CreateTargetGroup.html)。
     - 由于健康检查基于 TCP，pod 必须在该端口上接受 TCP 连接，目标才会变为 healthy。请确保 pod/ENI 的 SecurityGroup 放行该端口上的健康检查及客户端流量。
 
+#### AllocatePolicy
+- 含义：当 NlbARNs 配置了多个 NLB 时，端口在这些 NLB 之间的分配策略。仅在配置多个 NLB 时有意义。
+- 填写格式：`default` 或 `balanced`
+    - **default**（首次适配 / 溢出）：按 NlbARNs 中的顺序分配，填满前一个 NLB 后再溢出到下一个。这是原有行为。
+    - **balanced**（均衡）：分配到当前空闲端口最多的 NLB，使游戏服均匀分布在各 NLB 上。适用于故障域隔离（单个 NLB 故障或达到 listener 上限时，受影响的游戏服更少）。
+- 默认值：`default`（保持向后兼容；已有的 GameServerSet 不受影响）。
+- 是否支持变更：是
+- 说明：端口占用按 NLB 分别记录，因此同一端口号（如 9001）可同时用于不同的 NLB —— 它们是不同的接入点（NLB 的 DNS 名不同）。
+
 #### Fixed
 - 含义：是否固定访问端口。若是，即使pod删除重建，网络内外映射关系不会改变
 - 填写格式：false / true
@@ -187,3 +196,26 @@ networkStatus:
     lastTransitionTime: "2024-05-30T03:34:14Z"
     networkType: AmazonWebServices-NLB
 ```
+### 使用示例：多 NLB + 均衡分配（balanced）
+
+当游戏服数量超过单个 NLB 的 listener 上限（配额 `L-B6DF7632`，默认 50）时，
+在 `NlbARNs` 中配置多个 NLB，并设置 `AllocatePolicy: balanced`，使游戏服均匀分布：
+
+```yaml
+  network:
+    networkType: AmazonWebServices-NLB
+    networkConf:
+    - name: NlbARNs
+      value: "arn:aws:elasticloadbalancing:us-east-1:xxxx:loadbalancer/net/nlb-a/aaaa,arn:aws:elasticloadbalancing:us-east-1:xxxx:loadbalancer/net/nlb-b/bbbb"
+    - name: AllocatePolicy
+      value: "balanced"
+    - name: NlbVPCId
+      value: "vpc-0bbc9f9f0ffexxxxx"
+    - name: PortProtocols
+      value: "8601/TCPUDP"
+```
+
+使用 `balanced` 时，30 个游戏服分布在 2 个 NLB 上大致为 15/15（每个新游戏服落到当前
+空闲端口最多的 NLB）；而 `default` 会先把第一个 NLB 填满再使用第二个。所有 NLB 都需
+提前在 AWS 中创建好并列入 `NlbARNs`；向运行中的 GameServerSet 的 `NlbARNs` 新增 NLB
+会触发该 GameServerSet 的网络重配，因此请提前做好容量规划。
