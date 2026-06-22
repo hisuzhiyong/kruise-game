@@ -2023,3 +2023,523 @@ func parseConf(t *testing.T, jsonStr string) []gamekruiseiov1alpha1.NetworkConfP
 	}
 	return conf
 }
+
+
+// =============================================================================
+// Scenario 2 fix: SOFT readiness signal — game.kruise.io/network-allocated
+//
+// These tests pin the contract that breaks the readiness deadlock described
+// in docs aws-nlb-plugin-cases.md Scenario 2:
+//
+//   - The annotation is set as soon as port allocation succeeds (in OnPodAdded
+//     and OnPodUpdated), BEFORE the NLB has confirmed the target healthy.
+//   - currentNetworkState is always "Ready" in network-allocated (soft).
+//   - The strict GameServerNetworkStatus annotation keeps its existing
+//     "NLB-confirmed reachable" semantic — it stays NotReady until the pod
+//     readiness gate flips True (NLB target health).
+//   - Behavior is orthogonal to Scenario 1: the function only writes a pod
+//     annotation; it does NOT mutate n.cache, n.podAllocate, ownerReferences,
+//     or any release path.
+// =============================================================================
+
+// Helper: parse the network-allocated JSON value and return the parsed status.
+// Fails the test if the annotation is absent or unparseable.
+func decodeNetworkAllocated(t *testing.T, pod *corev1.Pod) gamekruiseiov1alpha1.NetworkStatus {
+	t.Helper()
+	if pod == nil || pod.Annotations == nil {
+		t.Fatalf("pod or annotations nil")
+	}
+	raw, ok := pod.Annotations[NetworkAllocatedAnnoKey]
+	if !ok {
+		t.Fatalf("annotation %s missing on pod %s/%s; have: %v",
+			NetworkAllocatedAnnoKey, pod.Namespace, pod.Name, pod.Annotations)
+	}
+	var ns gamekruiseiov1alpha1.NetworkStatus
+	if err := json.Unmarshal([]byte(raw), &ns); err != nil {
+		t.Fatalf("unmarshal network-allocated %q: %v", raw, err)
+	}
+	return ns
+}
+
+// Pure helper test: a single TCP backend produces one internal + one external
+// address, currentNetworkState=Ready, endpoint derived from the ARN. This is
+// the foundational shape every other Scenario 2 test relies on.
+func TestSetNetworkAllocatedAnnotation_SingleTCP(t *testing.T) {
+	arn := testNlbARN
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "gd-0", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.7"},
+	}
+	backends := []*backend{{targetPort: 8601, protocol: corev1.ProtocolTCP}}
+	ports := []int32{951}
+
+	setNetworkAllocatedAnnotation(pod, arn, ports, backends)
+
+	ns := decodeNetworkAllocated(t, pod)
+	if ns.CurrentNetworkState != gamekruiseiov1alpha1.NetworkReady {
+		t.Errorf("currentNetworkState = %q, want Ready", ns.CurrentNetworkState)
+	}
+	if len(ns.InternalAddresses) != 1 || ns.InternalAddresses[0].IP != "10.0.0.7" {
+		t.Errorf("internalAddresses = %#v, want one entry with IP 10.0.0.7", ns.InternalAddresses)
+	}
+	if len(ns.InternalAddresses[0].Ports) != 1 ||
+		ns.InternalAddresses[0].Ports[0].Protocol != corev1.ProtocolTCP ||
+		ns.InternalAddresses[0].Ports[0].Port == nil ||
+		ns.InternalAddresses[0].Ports[0].Port.IntValue() != 8601 {
+		t.Errorf("internalAddress[0].ports = %#v, want one TCP port 8601", ns.InternalAddresses[0].Ports)
+	}
+	if len(ns.ExternalAddresses) != 1 ||
+		ns.ExternalAddresses[0].EndPoint != "aaa-1.elb.us-east-1.amazonaws.com" {
+		t.Errorf("externalAddresses[0].endPoint = %q, want NLB DNS",
+			ns.ExternalAddresses[0].EndPoint)
+	}
+	if len(ns.ExternalAddresses[0].Ports) != 1 ||
+		ns.ExternalAddresses[0].Ports[0].Port == nil ||
+		ns.ExternalAddresses[0].Ports[0].Port.IntValue() != 951 {
+		t.Errorf("externalAddress[0].ports = %#v, want frontend port 951", ns.ExternalAddresses[0].Ports)
+	}
+}
+
+// Synthetic ProtocolTCPUDP must expand into two address entries (one TCP, one
+// UDP) sharing the same frontend port — mirroring what consSvcPorts /
+// network-status emit. Business code reading either annotation gets the same
+// shape so a downwardAPI swap doesn't change parsing.
+func TestSetNetworkAllocatedAnnotation_TCPUDPExpands(t *testing.T) {
+	arn := testNlbARN
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "gd-0", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.7"},
+	}
+	backends := []*backend{{targetPort: 8601, protocol: ProtocolTCPUDP}}
+	ports := []int32{951}
+
+	setNetworkAllocatedAnnotation(pod, arn, ports, backends)
+
+	ns := decodeNetworkAllocated(t, pod)
+	if len(ns.InternalAddresses) != 2 || len(ns.ExternalAddresses) != 2 {
+		t.Fatalf("TCPUDP must expand to 2 entries; got internal=%d external=%d",
+			len(ns.InternalAddresses), len(ns.ExternalAddresses))
+	}
+
+	gotProtoSet := map[corev1.Protocol]bool{}
+	for i, ext := range ns.ExternalAddresses {
+		if len(ext.Ports) != 1 {
+			t.Fatalf("external[%d].ports len=%d, want 1", i, len(ext.Ports))
+		}
+		gotProtoSet[ext.Ports[0].Protocol] = true
+		if ext.Ports[0].Port == nil || ext.Ports[0].Port.IntValue() != 951 {
+			t.Errorf("external[%d] port=%v, want 951", i, ext.Ports[0].Port)
+		}
+	}
+	if !gotProtoSet[corev1.ProtocolTCP] || !gotProtoSet[corev1.ProtocolUDP] {
+		t.Errorf("TCPUDP expansion must produce both TCP and UDP, got %v", gotProtoSet)
+	}
+}
+
+// Idempotency: a second call with the same inputs must NOT churn the
+// annotation. We capture the byte-string and assert the second call leaves it
+// referentially equal (same value); this matches the early-out in the helper.
+func TestSetNetworkAllocatedAnnotation_Idempotent(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "gd-0", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.7"},
+	}
+	backends := []*backend{{targetPort: 8601, protocol: corev1.ProtocolTCP}}
+	ports := []int32{951}
+
+	setNetworkAllocatedAnnotation(pod, testNlbARN, ports, backends)
+	first := pod.Annotations[NetworkAllocatedAnnoKey]
+	if first == "" {
+		t.Fatal("first call did not set annotation")
+	}
+	setNetworkAllocatedAnnotation(pod, testNlbARN, ports, backends)
+	second := pod.Annotations[NetworkAllocatedAnnoKey]
+	if first != second {
+		t.Errorf("idempotent call should produce same value; before=%q after=%q", first, second)
+	}
+}
+
+// Pod IP backfill: the soft signal carries an empty IP when set during
+// OnPodAdded (pod not yet scheduled), but a subsequent set with the actual IP
+// updates the annotation in place. This pins the OnPodUpdated backfill path.
+func TestSetNetworkAllocatedAnnotation_PodIPBackfill(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "gd-0", Namespace: "default"},
+		// PodIP empty: simulates OnPodAdded.
+	}
+	backends := []*backend{{targetPort: 8601, protocol: corev1.ProtocolTCP}}
+	ports := []int32{951}
+
+	setNetworkAllocatedAnnotation(pod, testNlbARN, ports, backends)
+	ns := decodeNetworkAllocated(t, pod)
+	if ns.InternalAddresses[0].IP != "" {
+		t.Errorf("first set should have empty IP, got %q", ns.InternalAddresses[0].IP)
+	}
+
+	// Simulate OnPodUpdated: kubelet has now published pod IP.
+	pod.Status.PodIP = "10.0.0.7"
+	setNetworkAllocatedAnnotation(pod, testNlbARN, ports, backends)
+	ns = decodeNetworkAllocated(t, pod)
+	if ns.InternalAddresses[0].IP != "10.0.0.7" {
+		t.Errorf("backfill should populate IP 10.0.0.7, got %q", ns.InternalAddresses[0].IP)
+	}
+}
+
+// Defensive: malformed ARN means we cannot construct a meaningful endpoint,
+// so the helper must not write a half-built annotation that would mislead
+// business code. Same contract for empty backends/ports/lbARN.
+func TestSetNetworkAllocatedAnnotation_DegenerateInputsSilent(t *testing.T) {
+	cases := []struct {
+		name     string
+		pod      *corev1.Pod
+		lbARN    string
+		ports    []int32
+		backends []*backend
+	}{
+		{
+			name:     "nil pod",
+			pod:      nil,
+			lbARN:    testNlbARN,
+			ports:    []int32{951},
+			backends: []*backend{{targetPort: 8601, protocol: corev1.ProtocolTCP}},
+		},
+		{
+			name:     "empty arn",
+			pod:      &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}},
+			lbARN:    "",
+			ports:    []int32{951},
+			backends: []*backend{{targetPort: 8601, protocol: corev1.ProtocolTCP}},
+		},
+		{
+			name:     "malformed arn",
+			pod:      &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}},
+			lbARN:    "not-an-arn",
+			ports:    []int32{951},
+			backends: []*backend{{targetPort: 8601, protocol: corev1.ProtocolTCP}},
+		},
+		{
+			name:     "no ports",
+			pod:      &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}},
+			lbARN:    testNlbARN,
+			ports:    nil,
+			backends: []*backend{{targetPort: 8601, protocol: corev1.ProtocolTCP}},
+		},
+		{
+			name:     "no backends",
+			pod:      &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}},
+			lbARN:    testNlbARN,
+			ports:    []int32{951},
+			backends: nil,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			setNetworkAllocatedAnnotation(c.pod, c.lbARN, c.ports, c.backends)
+			if c.pod != nil {
+				if v, ok := c.pod.Annotations[NetworkAllocatedAnnoKey]; ok {
+					t.Errorf("expected no annotation written for degenerate input; got %q", v)
+				}
+			}
+		})
+	}
+}
+
+// OnPodAdded must write game.kruise.io/network-allocated as soon as port
+// allocation succeeds — this is the primary fix for Scenario 2: business
+// downwardAPI sees "Ready" before the NLB target health check has had a
+// chance to fail.
+func TestOnPodAdded_WritesNetworkAllocatedAnnotation(t *testing.T) {
+	arn := testNlbARN
+	n := newNlbForPolicy()
+	conf := `[{"name":"NlbARNs","value":"` + arn + `"},{"name":"PortProtocols","value":"8601/TCP"},{"name":"NlbVPCId","value":"vpc-1"}]`
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gd-0",
+			Namespace: "default",
+			Annotations: map[string]string{
+				gamekruiseiov1alpha1.GameServerNetworkType: NlbNetwork,
+				gamekruiseiov1alpha1.GameServerNetworkConf: conf,
+			},
+		},
+	}
+	got, perr := n.OnPodAdded(nil, pod, nil)
+	if perr != nil {
+		t.Fatalf("OnPodAdded error: %v", perr)
+	}
+
+	ns := decodeNetworkAllocated(t, got)
+	if ns.CurrentNetworkState != gamekruiseiov1alpha1.NetworkReady {
+		t.Errorf("network-allocated currentNetworkState=%q, want Ready (the soft signal must flip Ready upon allocation)", ns.CurrentNetworkState)
+	}
+	if len(ns.ExternalAddresses) != 1 ||
+		ns.ExternalAddresses[0].EndPoint != "aaa-1.elb.us-east-1.amazonaws.com" {
+		t.Errorf("expected external endpoint derived from ARN; got %#v", ns.ExternalAddresses)
+	}
+	// IP empty here is expected (pod not yet scheduled in OnPodAdded).
+	if ns.InternalAddresses[0].IP != "" {
+		t.Errorf("expected empty internal IP at OnPodAdded time, got %q", ns.InternalAddresses[0].IP)
+	}
+
+	// network-status must NOT be touched here — that strict signal is owned
+	// by OnPodUpdated and depends on NLB health.
+	if _, ok := got.Annotations[gamekruiseiov1alpha1.GameServerNetworkStatus]; ok {
+		t.Errorf("OnPodAdded must not write network-status (strict signal); got %q",
+			got.Annotations[gamekruiseiov1alpha1.GameServerNetworkStatus])
+	}
+}
+
+// Multi-port + TCPUDP: OnPodAdded must produce a network-allocated payload
+// whose entry count matches consSvcPorts expansion (TCPUDP -> 2 entries).
+func TestOnPodAdded_NetworkAllocatedTCPUDPMulti(t *testing.T) {
+	arn := testNlbARN
+	n := newNlbForPolicy()
+	conf := `[{"name":"NlbARNs","value":"` + arn + `"},{"name":"PortProtocols","value":"8601/TCPUDP,8602/TCP"},{"name":"NlbVPCId","value":"vpc-1"}]`
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gd-0",
+			Namespace: "default",
+			Annotations: map[string]string{
+				gamekruiseiov1alpha1.GameServerNetworkType: NlbNetwork,
+				gamekruiseiov1alpha1.GameServerNetworkConf: conf,
+			},
+		},
+	}
+	got, perr := n.OnPodAdded(nil, pod, nil)
+	if perr != nil {
+		t.Fatalf("OnPodAdded error: %v", perr)
+	}
+	ns := decodeNetworkAllocated(t, got)
+	// 2 (TCPUDP expansion) + 1 (TCP) = 3 entries
+	if len(ns.InternalAddresses) != 3 || len(ns.ExternalAddresses) != 3 {
+		t.Errorf("expected 3 address entries (TCPUDP+TCP); got internal=%d external=%d",
+			len(ns.InternalAddresses), len(ns.ExternalAddresses))
+	}
+}
+
+// The KEY invariant for Scenario 2: when the pod is NOT yet PodReady (NLB
+// target still unhealthy), OnPodUpdated must STILL keep network-allocated set
+// to "Ready" while network-status stays "NotReady". This is the moment that
+// breaks the deadlock: business reads network-allocated, sees Ready, listens.
+func TestOnPodUpdated_NetworkAllocatedReadyWhileNetworkStatusNotReady(t *testing.T) {
+	scheme := nlbTestScheme(t)
+	conf := validNlbConf(testNlbARN, "8601/TCP")
+
+	// Pod is created and NOT yet Ready (NLB target health not flipped).
+	pod := mkNlbPod("gd-0", "default", conf, `{"currentNetworkState":"NotReady"}`)
+	pod.Status.PodIP = "10.0.0.7"
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+	}
+
+	// SVC + TGB exist (matches what syncTargetGroupAndService produced earlier).
+	parsed := parseLbConfig(parseConf(t, conf))
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gd-0",
+			Namespace: "default",
+			Annotations: map[string]string{
+				NlbARNAnnoKey:    testNlbARN,
+				NlbConfigHashKey: parsed.configHash(),
+			},
+			Labels: map[string]string{ResourceTagKey: ResourceTagValue, SvcSelectorKey: "gd-0"},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{{Port: 951, TargetPort: intstr.FromInt(8601), Protocol: corev1.ProtocolTCP}},
+		},
+	}
+	tgb := &elbv2api.TargetGroupBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gd-0-951",
+			Namespace: "default",
+			Labels:    map[string]string{ResourceTagKey: ResourceTagValue, SvcSelectorKey: "gd-0"},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, svc, tgb).Build()
+
+	n := newNlbForPolicy()
+	// Mimic OnPodAdded having allocated already: pin the entry in podAllocate
+	// so OnPodUpdated's early backfill finds it.
+	n.podAllocate["default/gd-0"] = &nlbPorts{arn: testNlbARN, ports: []int32{951}}
+
+	got, perr := n.OnPodUpdated(c, pod, context.Background())
+	if perr != nil {
+		t.Fatalf("OnPodUpdated error: %v", perr)
+	}
+
+	// Soft signal MUST be Ready (this is the deadlock-breaker).
+	allocated := decodeNetworkAllocated(t, got)
+	if allocated.CurrentNetworkState != gamekruiseiov1alpha1.NetworkReady {
+		t.Errorf("network-allocated must be Ready while pod not Ready (deadlock-breaker); got %q",
+			allocated.CurrentNetworkState)
+	}
+	if allocated.InternalAddresses[0].IP != "10.0.0.7" {
+		t.Errorf("network-allocated IP backfilled from PodIP; want 10.0.0.7, got %q",
+			allocated.InternalAddresses[0].IP)
+	}
+
+	// Strict signal MUST stay NotReady (semantic preserved).
+	annStatus := got.Annotations[gamekruiseiov1alpha1.GameServerNetworkStatus]
+	if !contains(annStatus, "NotReady") {
+		t.Errorf("network-status must remain NotReady while pod not Ready; got %q", annStatus)
+	}
+}
+
+// Co-existence: when the pod IS PodReady, the strict signal flips to Ready
+// (existing behavior), AND the soft signal stays Ready. Both annotations
+// converge, both carry the same shape — business code can read either.
+func TestOnPodUpdated_NetworkAllocatedAlongsideStrictReady(t *testing.T) {
+	scheme := nlbTestScheme(t)
+	conf := validNlbConf(testNlbARN, "8601/TCP")
+
+	pod := mkNlbPod("gd-0", "default", conf, `{"currentNetworkState":"NotReady"}`)
+	pod.Status = corev1.PodStatus{
+		PodIP:      "10.0.0.7",
+		Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+	}
+
+	parsed := parseLbConfig(parseConf(t, conf))
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gd-0",
+			Namespace: "default",
+			Annotations: map[string]string{
+				NlbARNAnnoKey:    testNlbARN,
+				NlbConfigHashKey: parsed.configHash(),
+			},
+			Labels: map[string]string{ResourceTagKey: ResourceTagValue, SvcSelectorKey: "gd-0"},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{{Port: 951, TargetPort: intstr.FromInt(8601), Protocol: corev1.ProtocolTCP}},
+		},
+	}
+	tgb := &elbv2api.TargetGroupBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gd-0-951",
+			Namespace: "default",
+			Labels:    map[string]string{ResourceTagKey: ResourceTagValue, SvcSelectorKey: "gd-0"},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, svc, tgb).Build()
+
+	n := newNlbForPolicy()
+	n.podAllocate["default/gd-0"] = &nlbPorts{arn: testNlbARN, ports: []int32{951}}
+
+	got, perr := n.OnPodUpdated(c, pod, context.Background())
+	if perr != nil {
+		t.Fatalf("OnPodUpdated error: %v", perr)
+	}
+
+	allocated := decodeNetworkAllocated(t, got)
+	if allocated.CurrentNetworkState != gamekruiseiov1alpha1.NetworkReady {
+		t.Errorf("network-allocated must be Ready, got %q", allocated.CurrentNetworkState)
+	}
+	annStatus := got.Annotations[gamekruiseiov1alpha1.GameServerNetworkStatus]
+	if !contains(annStatus, `"currentNetworkState":"Ready"`) {
+		t.Errorf("network-status must transition to Ready when pod is PodReady; got %q", annStatus)
+	}
+}
+
+// SVC NotFound branch: even when OnPodAdded did NOT run first (i.e. n.podAllocate
+// is empty entering OnPodUpdated), the very first reconcile's
+// syncTargetGroupAndService allocation MUST be followed by a network-allocated
+// write so business doesn't have to wait for a second reconcile to see the
+// soft signal.
+func TestOnPodUpdated_SvcNotFound_WritesNetworkAllocated(t *testing.T) {
+	scheme := nlbTestScheme(t)
+	conf := validNlbConf(testNlbARN, "8601/TCP")
+	pod := mkNlbPod("gd-0", "default", conf, `{"currentNetworkState":"NotReady"}`)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+
+	n := newNlbForPolicy()
+	got, perr := n.OnPodUpdated(c, pod, context.Background())
+	if perr != nil {
+		t.Fatalf("OnPodUpdated error: %v", perr)
+	}
+
+	allocated := decodeNetworkAllocated(t, got)
+	if allocated.CurrentNetworkState != gamekruiseiov1alpha1.NetworkReady {
+		t.Errorf("network-allocated must be Ready right after SVC NotFound -> sync; got %q",
+			allocated.CurrentNetworkState)
+	}
+	if len(allocated.ExternalAddresses) == 0 ||
+		allocated.ExternalAddresses[0].EndPoint != "aaa-1.elb.us-east-1.amazonaws.com" {
+		t.Errorf("network-allocated must carry endpoint after sync; got %#v", allocated.ExternalAddresses)
+	}
+}
+
+// Compatibility with Scenario 1 (Fixed=true, GSS still alive):
+// OnPodDeleted must NOT touch n.cache, n.podAllocate, or any other state when
+// it sees a Fixed=true pod whose GSS is still present. That contract is the
+// core of Scenario 1's fix; the new soft-signal annotation must not regress
+// it. We also confirm the new annotation is purely pod-local — deleting the
+// pod leaves no controller-side residue tied to it.
+//
+// Rationale: this asserts the orthogonality property by exercising the
+// OnPodDeleted GSS-alive early-return path. If a future refactor accidentally
+// makes the soft signal call any state-mutating helper (e.g. deAllocate),
+// this test would catch it because n.cache / n.podAllocate would change.
+func TestOnPodDeleted_FixedTrueGssAlive_StateUnchanged_AfterSoftSignal(t *testing.T) {
+	scheme := nlbTestScheme(t)
+	// Need GSS in scheme for util.GetGameServerSetOfPod (Fixed=true path).
+	if err := gamekruiseiov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add gamekruise scheme: %v", err)
+	}
+
+	conf := `[` +
+		`{"name":"NlbARNs","value":"` + testNlbARN + `"},` +
+		`{"name":"PortProtocols","value":"8601/TCP"},` +
+		`{"name":"NlbVPCId","value":"vpc-1"},` +
+		`{"name":"Fixed","value":"true"}]`
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "g-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				gamekruiseiov1alpha1.GameServerOwnerGssKey: "g",
+			},
+			Annotations: map[string]string{
+				gamekruiseiov1alpha1.GameServerNetworkType: NlbNetwork,
+				gamekruiseiov1alpha1.GameServerNetworkConf: conf,
+			},
+		},
+		Status: corev1.PodStatus{PodIP: "10.0.0.7"},
+	}
+	gss := &gamekruiseiov1alpha1.GameServerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "g", Namespace: "default"},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, gss).Build()
+
+	n := newNlbForPolicy()
+	// Pre-populate as if allocate had run before — Scenario 1's invariant is
+	// that the cache / podAllocate must NOT change on this OnPodDeleted call.
+	n.podAllocate["default/g-0"] = &nlbPorts{arn: testNlbARN, ports: []int32{951}}
+	n.initCache(testNlbARN)
+	n.cache[testNlbARN][951] = true
+
+	// Pre-set the soft-signal annotation so we can verify it isn't disturbed
+	// by OnPodDeleted (the annotation is pod-local; the delete path doesn't
+	// touch annotations on the live pod object — kubelet removes the pod).
+	setNetworkAllocatedAnnotation(pod, testNlbARN, []int32{951},
+		[]*backend{{targetPort: 8601, protocol: corev1.ProtocolTCP}})
+
+	if perr := n.OnPodDeleted(c, pod, context.Background()); perr != nil {
+		t.Fatalf("OnPodDeleted error: %v", perr)
+	}
+
+	// Scenario 1 invariant: GSS alive + Fixed=true -> no release.
+	if alloc, ok := n.podAllocate["default/g-0"]; !ok || alloc == nil ||
+		alloc.arn != testNlbARN || len(alloc.ports) != 1 || alloc.ports[0] != 951 {
+		t.Errorf("podAllocate must be untouched (Scenario 1 fixed-IP); got %#v", alloc)
+	}
+	if !n.cache[testNlbARN][951] {
+		t.Errorf("cache port 951 must remain occupied (Scenario 1 fixed-IP)")
+	}
+	// And the new annotation is purely additive — nothing in OnPodDeleted
+	// reads or rewrites it.
+	if _, ok := pod.Annotations[NetworkAllocatedAnnoKey]; !ok {
+		t.Errorf("network-allocated annotation should remain on the pod object after OnPodDeleted")
+	}
+}

@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/json"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	log "k8s.io/klog/v2"
@@ -68,8 +69,30 @@ const (
 	// NLB reachability rather than just "Service/TargetGroupBinding created".
 	ReadinessGatePrefix = "target-health.elbv2.k8s.aws/"
 	NlbConfigHashKey    = "game.kruise.io/network-config-hash"
-	ResourceTagKey      = "managed-by"
-	ResourceTagValue    = "game.kruise.io"
+	// NetworkAllocatedAnnoKey is the SOFT readiness signal written on the pod
+	// by this plugin. It exists to break the readiness deadlock described in
+	// docs aws-nlb-plugin-cases.md Scenario 2: business code that gates
+	// "start listening" on game.kruise.io/network-status=Ready creates a
+	// circular wait — the NLB health check needs the pod to listen, the AWS
+	// LBC readiness gate needs the NLB to report the target healthy,
+	// network-status needs the gate True — and nothing ever listens.
+	//
+	// Semantics:
+	//   - network-allocated  : "ports are allocated, your external endpoint is
+	//                          known, you MAY start listening now". External
+	//                          reachability is NOT yet confirmed.
+	//   - network-status     : (unchanged) "the NLB has confirmed your target
+	//                          is healthy and externally reachable".
+	//
+	// The JSON shape matches v1alpha1.NetworkStatus so a downwardAPI fieldPath
+	// can be swapped between the two without touching business parsing code.
+	// currentNetworkState is always "Ready" in network-allocated (the soft
+	// semantic — allocation succeeded). This annotation is kept local to this
+	// plugin to avoid touching the cross-cutting v1alpha1 API surface; other
+	// plugins can adopt the same key independently if/when they need it.
+	NetworkAllocatedAnnoKey = "game.kruise.io/network-allocated"
+	ResourceTagKey          = "managed-by"
+	ResourceTagValue        = "game.kruise.io"
 )
 
 // ghostRegistrationStuckSeconds is how long a readiness gate may stay False
@@ -365,6 +388,17 @@ func (n *NlbPlugin) OnPodAdded(c client.Client, pod *corev1.Pod, ctx context.Con
 			})
 		}
 	}
+
+	// Project the SOFT readiness signal onto the pod BEFORE it is persisted.
+	// Business code that reads game.kruise.io/network-allocated via downwardAPI
+	// will see "Ready" as soon as the pod is created and can start listening
+	// without waiting for the strict network-status (which depends on NLB
+	// target health). See setNetworkAllocatedAnnotation for details.
+	// Note: pod.Status.PodIP is typically empty here (pod not yet scheduled);
+	// internalAddresses[*].IP will be backfilled by OnPodUpdated once kubelet
+	// publishes the pod IP.
+	setNetworkAllocatedAnnotation(pod, allocatedPorts.arn, allocatedPorts.ports, conf.backends)
+
 	return pod, nil
 }
 
@@ -380,6 +414,25 @@ func (n *NlbPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx context.C
 	if err := validateLbConfig(lbConfig); err != nil {
 		return pod, cperrors.NewPluginErrorWithMessage(cperrors.ParameterError, err.Error())
 	}
+
+	// Project / refresh the SOFT readiness signal as early as possible, before
+	// any of the conditional return paths below. If an allocation already
+	// exists for this pod (set by OnPodAdded for a fresh pod, or rebuilt by
+	// initLbCache after a controller restart), publish the network-allocated
+	// annotation now so business code reading it via downwardAPI sees the
+	// authoritative endpoint + ports as soon as possible — and crucially, the
+	// internalAddresses[*].IP gets backfilled as soon as kubelet publishes
+	// pod.Status.PodIP (OnPodAdded saw an empty IP). The set is idempotent
+	// (no-op when the value would be unchanged), so we can safely run it on
+	// every reconcile. This also covers the controller-upgrade case where
+	// pre-existing pods have no network-allocated annotation: the next
+	// OnPodUpdated backfills it. Does NOT touch n.cache / n.podAllocate, so
+	// it is fully orthogonal to the Scenario 1 fix in OnPodDeleted /
+	// OnGameServerSetDeleted.
+	if podAlloc, exist := n.podAllocate[pod.GetNamespace()+"/"+pod.GetName()]; exist && podAlloc != nil {
+		setNetworkAllocatedAnnotation(pod, podAlloc.arn, podAlloc.ports, lbConfig.backends)
+	}
+
 	if networkStatus == nil {
 		pod, err := networkManager.UpdateNetworkStatus(gamekruiseiov1alpha1.NetworkStatus{
 			CurrentNetworkState: gamekruiseiov1alpha1.NetworkNotReady,
@@ -395,7 +448,17 @@ func (n *NlbPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx context.C
 	}, svc)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return pod, cperrors.ToPluginError(n.syncTargetGroupAndService(lbConfig, pod, c, ctx), cperrors.ApiCallError)
+			if syncErr := n.syncTargetGroupAndService(lbConfig, pod, c, ctx); syncErr != nil {
+				return pod, cperrors.ToPluginError(syncErr, cperrors.ApiCallError)
+			}
+			// syncTargetGroupAndService just (re)populated n.podAllocate via
+			// allocate(). Re-project the soft signal so this very first
+			// reconcile already carries network-allocated, even for callers
+			// (e.g. unit tests) that did not invoke OnPodAdded first.
+			if podAlloc, exist := n.podAllocate[pod.GetNamespace()+"/"+pod.GetName()]; exist && podAlloc != nil {
+				setNetworkAllocatedAnnotation(pod, podAlloc.arn, podAlloc.ports, lbConfig.backends)
+			}
+			return pod, nil
 		}
 		return pod, cperrors.NewPluginErrorWithMessage(cperrors.ApiCallError, err.Error())
 	}
@@ -561,6 +624,111 @@ func generateNlbEndpoint(nlbARN string) string {
 	region := parts[3]
 	loadBalancerName := strings.ReplaceAll(strings.TrimPrefix(parts[5], loadBalancerPrefix), "/", "-")
 	return fmt.Sprintf("%s.elb.%s.amazonaws.com", loadBalancerName, region)
+}
+
+// setNetworkAllocatedAnnotation projects the SOFT readiness signal onto
+// pod.metadata.annotations[NetworkAllocatedAnnoKey].
+//
+// This breaks the readiness deadlock described in docs aws-nlb-plugin-cases.md
+// Scenario 2: business code that gates "start listening" on
+// game.kruise.io/network-status=Ready creates a circular wait:
+//
+//	business waits network-status=Ready  ->  business does NOT listen
+//	-> NLB TCP health check fails        ->  AWS LBC readiness gate stays False
+//	-> Pod.Ready=False                   ->  OKG writes network-status=NotReady
+//	-> business still waiting            ->  loop forever
+//
+// The cure is to give business an EARLIER signal — "your endpoint is allocated,
+// you may start listening now" — without waiting for NLB target health. Once
+// business listens, the NLB health check passes, the AWS LBC readiness gate
+// flips True, the pod becomes PodReady, and OnPodUpdated writes the strict
+// network-status=Ready as before. network-status semantics are unchanged.
+//
+// Shape: the JSON value is a v1alpha1.NetworkStatus, identical to what
+// network-status carries, so a downwardAPI fieldPath can be swapped between
+// the two without touching the business parsing code. currentNetworkState is
+// always "Ready" in this annotation (the soft semantic — ports allocated).
+//
+// Idempotency: only writes when the serialized payload would change, so it
+// does not churn the pod on every OnPodUpdated reconcile.
+//
+// Compat with Scenario 1: this function only writes a pod-local annotation;
+// it does NOT touch n.cache, n.podAllocate, OnPodDeleted/OnGameServerSetDeleted
+// release paths, or any owner reference. It is purely additive.
+func setNetworkAllocatedAnnotation(pod *corev1.Pod, lbARN string, ports []int32, backends []*backend) {
+	if pod == nil || lbARN == "" || len(ports) == 0 || len(backends) == 0 {
+		return
+	}
+	endpoint := generateNlbEndpoint(lbARN)
+	if endpoint == "" {
+		// Malformed ARN: don't emit a misleading half-built signal.
+		return
+	}
+
+	// Iterate over backends, expanding the synthetic ProtocolTCPUDP into
+	// separate TCP and UDP entries so the shape mirrors what consSvcPorts /
+	// network-status emit later. Both annotations stay structurally
+	// consistent; business code reading either gets the same view.
+	pairs := 0
+	for _, b := range backends {
+		if b.protocol == ProtocolTCPUDP {
+			pairs += 2
+		} else {
+			pairs++
+		}
+	}
+	internal := make([]gamekruiseiov1alpha1.NetworkAddress, 0, pairs)
+	external := make([]gamekruiseiov1alpha1.NetworkAddress, 0, pairs)
+
+	upper := len(backends)
+	if len(ports) < upper {
+		upper = len(ports)
+	}
+	for i := 0; i < upper; i++ {
+		baseName := strconv.Itoa(backends[i].targetPort)
+		var protocols []corev1.Protocol
+		var nameSuffixes []string
+		if backends[i].protocol == ProtocolTCPUDP {
+			protocols = []corev1.Protocol{corev1.ProtocolTCP, corev1.ProtocolUDP}
+			nameSuffixes = []string{"-tcp", "-udp"}
+		} else {
+			protocols = []corev1.Protocol{backends[i].protocol}
+			nameSuffixes = []string{""}
+		}
+		for j, proto := range protocols {
+			tp := intstr.FromInt(backends[i].targetPort)
+			fp := intstr.FromInt(int(ports[i]))
+			portName := baseName + nameSuffixes[j]
+			internal = append(internal, gamekruiseiov1alpha1.NetworkAddress{
+				IP: pod.Status.PodIP,
+				Ports: []gamekruiseiov1alpha1.NetworkPort{
+					{Name: portName, Port: &tp, Protocol: proto},
+				},
+			})
+			external = append(external, gamekruiseiov1alpha1.NetworkAddress{
+				EndPoint: endpoint,
+				Ports: []gamekruiseiov1alpha1.NetworkPort{
+					{Name: portName, Port: &fp, Protocol: proto},
+				},
+			})
+		}
+	}
+
+	payload := gamekruiseiov1alpha1.NetworkStatus{
+		InternalAddresses:   internal,
+		ExternalAddresses:   external,
+		CurrentNetworkState: gamekruiseiov1alpha1.NetworkReady,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	if pod.Annotations[NetworkAllocatedAnnoKey] != string(data) {
+		pod.Annotations[NetworkAllocatedAnnoKey] = string(data)
+	}
 }
 
 func (n *NlbPlugin) OnPodDeleted(client client.Client, pod *corev1.Pod, ctx context.Context) cperrors.PluginError {
